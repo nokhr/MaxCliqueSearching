@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 using ConsoleApp1.Classes;
 using System.Timers;
 using System.IO;
+using ILOG.Concert;
+using ILOG.CPLEX;
 
 namespace ConsoleApp1
 {
@@ -22,6 +24,7 @@ namespace ConsoleApp1
     {
         static Random random = null;
         public static List<int> globalClick = new List<int>();
+        public static int branchNumber = 0;
         static int Bound;
         static List<int> maxClique;
         static string graphFile = "";
@@ -58,54 +61,82 @@ namespace ConsoleApp1
                 //Раскраска графа
                 int top = (from v in nodeAndNeighbors.Keys.ToList() select v).ToList<int>()[0];
                 Dictionary<int, int> colorizedGraph = new Dictionary<int, int>();
-                int count = 0;
-                foreach (KeyValuePair<int, int> pair in nodeAndNeighbors)
-                {
-                    //Обработаем первую вершину из списка - покрасим ее в 1 цвет
-                    if (count == 0)
-                    {
-                        colorizedGraph.Add(pair.Key, colors[0]);
-                        count++;
-                    }
-                    else
-                    {
-                        //Получить список соседей для данной вершины
-                        List<int> neighbors = graph.GetNeighbors(pair.Key);
-                        //Получить минимальный цвет из списка цветов, в который не окрашен ни один из соседей
-                        neighbors = neighbors.Intersect(colorizedGraph.Keys.ToList<int>()).ToList<int>();//Список окрашенных соседей
-                        var cols = (from n in colorizedGraph where neighbors.Exists(x => x==n.Key) select n.Value).Distinct().ToList<int>();//Список различных цветов окрашенных соседей
-                        var avaliable = colors.Except(cols).ToList<int>();
-                        //Если такого цвета нет - создать и добавить в список доступных цветов
-                        if (avaliable.Count()==0)
-                        {
-                            int newColor = colors.Max() + 1;
-                            colors.Add(newColor);
-                            colorizedGraph.Add(pair.Key, newColor);
-                        }
-                        else
-                        {
-                            int color = avaliable.Min();
-                            colorizedGraph.Add(pair.Key, color);
-                        }
-                        
-                    }
-                }
+                //Раскрасим граф
+                colorizedGraph = colorize(nodeAndNeighbors.Keys.ToList<int>(), graph);
                 int cntr = 0;
-                //Максимальная клика, которую можно найти для вершины - это количество различных цветов, в которые окрашены все ее соседи плюс она  сама
-                foreach(KeyValuePair<int,int> pair in nodeAndNeighbors)
+                //Зададим базовую модель
+                Cplex cplex = new Cplex();
+                IRange[][] rng = new IRange[1][];
+                INumVar[][] var = new INumVar[1][];
+                rng[0] = new IRange[graph.NumberNodes * graph.NumberNodes];
+                // add the objective function
+                double[] objvals = new double[graph.NumberNodes];
+                string[] varname = new string[graph.NumberNodes];
+                for (int i = 0; i < graph.NumberNodes; i++)
                 {
-                        List<int> neighbors = graph.GetNeighbors(pair.Key);
-                        neighbors.Add(pair.Key);
-                        var cols = (from n in colorizedGraph where neighbors.Exists(x => x == n.Key) select n.Value).Distinct().ToList<int>();
-                        if (cols.Count() >= Bound && cols.Count() >= globalClick.Count())
-                        {
-                            clique.Add(new List<int>());
-                            List<int> cur = new List<int>();
-                            RecursiveSearch(pair.Key, ref cur, ref neighbors, graph);
-                            clique[cntr] = cur;
-                            cntr++;
-                        }
+                    objvals[i] = 1.0;
+                    varname[i] = "x" + (i + 1);
                 }
+                INumVar[] x = cplex.NumVarArray(graph.NumberNodes, 0.0, 1.0, varname);
+                var[0] = x;
+                //Ограничение, что х лежит от нуля до единицы задали при инициализации
+                cplex.AddMaximize(cplex.ScalProd(x, objvals));
+                //Получим номер максимального цвета = это количество цветов, в которые окрашен граф
+                //Будем иметь в виду, что количество цветов - это верхняя оценка на размер клики, а найденная эвристически клика на первом этапе - нижняя оценка.
+                int colorCount = colorizedGraph.Values.Max();
+                List<int> colorizedNodes = new List<int>();
+                int pointer = 1;
+                //Добавим ограничение, что вершины, входящие в один цветовой класс, не связаны между собой
+                for (int i = 1; i <= colorCount; ++i)
+                {
+                    colorizedNodes = (from t in colorizedGraph where t.Value == i select t.Key).ToList<int>();
+                    if (colorizedNodes.Count() != 1)
+                    {
+                        INumExpr[] constraint = new INumExpr[colorizedNodes.Count()];
+                        int counter = 0;
+                        colorizedNodes.ForEach(node =>
+                        {
+                            constraint[counter] = cplex.Prod(1.0, x[node]);
+                            counter++;
+                        });
+                        rng[0][pointer] = cplex.AddLe(cplex.Sum(constraint), 1.0, "c" + (pointer));
+                        pointer++;
+                    }
+                }
+                for (int i =0; i<graph.NumberNodes; i++)
+                {
+                    for (int j = i+1; j<graph.NumberNodes; j++)
+                    {
+                        if (!graph.AreAdjacent(i, j))
+                        {
+                            rng[0][pointer] = cplex.AddLe(cplex.Sum(cplex.Prod(1.0, x[i]), cplex.Prod(1.0, x[j])), 1.0, "c" + (pointer));
+                            pointer++;
+                        }
+                    }
+                }
+
+                //------------------------------------------------------------------------
+                //-----Пробуем решать задачу ровно до тех пор, пока не получим клику------
+                //-----Помним про ограничения на размер клики-----------------------------
+                int countOfConstraint = colorCount;
+                globalClick = maxClique;
+                Branching(cplex, x);
+                cplex.End();
+                ////Максимальная клика, которую можно найти для вершины - это количество различных цветов, в которые окрашены все ее соседи плюс она  сама
+                //foreach (KeyValuePair<int,int> pair in nodeAndNeighbors)
+                //{
+                //        List<int> neighbors = graph.GetNeighbors(pair.Key);
+                //        neighbors.Add(pair.Key);
+                //        var cols = (from n in colorizedGraph where neighbors.Exists(t => t == n.Key) select n.Value).Distinct().ToList<int>();
+                //        if (cols.Count() >= Bound && cols.Count() >= globalClick.Count())
+                //        {
+                //            clique.Add(new List<int>());
+                //            List<int> cur = new List<int>();
+                //            RecursiveSearch(pair.Key, ref cur, ref neighbors, graph);
+                //            clique[cntr] = cur;
+                //            cntr++;
+                //        }
+                //}
                 TimeSpan time = (DateTime.Now - startTime);
                 Console.WriteLine("Time to find " + time);
                 Console.WriteLine(globalClick.Count());
@@ -113,13 +144,112 @@ namespace ConsoleApp1
                 WriteResults(time, globalClick, false);
 
             }
-            catch (Exception ex)
+            catch (System.Exception ex)
             {
                 Console.WriteLine("Fatal: " + ex.Message);
+                Console.WriteLine(ex.StackTrace);
                 Console.ReadKey();
             }
         }
-        
+        private static Dictionary<int, int> colorize(List<int> nodes, MyGraph graph)
+        {
+            //Раскраска графа
+            List<int> colors = new List<int>() { 1 };
+            Dictionary<int, int> colorizedGraph = new Dictionary<int, int>();
+            int count = 0;
+            nodes.ForEach(n =>
+            {
+                //Обработаем первую вершину из списка - покрасим ее в 1 цвет
+                if (count == 0)
+                {
+                    colorizedGraph.Add(n, colors[0]);
+                    count++;
+                }
+                else
+                {
+                    //Получить список соседей для данной вершины
+                    List<int> neighbors = graph.GetNeighbors(n).Intersect(nodes).ToList<int>();
+                    //Получить минимальный цвет из списка цветов, в который не окрашен ни один из соседей
+                    neighbors = neighbors.Intersect(colorizedGraph.Keys.ToList<int>()).ToList<int>();//Список окрашенных соседей
+                    var cols = (from c in colorizedGraph where neighbors.Exists(t => t == c.Key) select c.Value).Distinct().ToList<int>();//Список различных цветов окрашенных соседей
+                    var avaliable = colors.Except(cols).ToList<int>();
+                    //Если такого цвета нет - создать и добавить в список доступных цветов
+                    if (avaliable.Count() == 0)
+                    {
+                        int newColor = colors.Max() + 1;
+                        colors.Add(newColor);
+                        colorizedGraph.Add(n, newColor);
+                    }
+                    else
+                    {
+                        int color = avaliable.Min();
+                        colorizedGraph.Add(n, color);
+                    }
+                }
+
+            });
+            return colorizedGraph;   
+        }
+        private static int Branching( Cplex cplex, INumVar[] x)
+        {
+            cplex.Solve();
+            double[] res = cplex.GetValues(x);
+            double[] dj = cplex.GetReducedCosts(x);
+            double solveResult = res.Sum();
+            if (solveResult>globalClick.Count)
+            {
+                //Пытаемся выполнить ветвление
+                //Если ветвиться не по чему - это наша искомая клика
+                int? BranchNode = getNodeForBranching(res);
+                if (BranchNode == null)
+                {
+                    var click = getClickFromSolution(res);
+                    if (click.Count> globalClick.Count)
+                    {
+                        globalClick = click;
+                    }
+                    return click.Count();
+                }
+                else
+                {
+                    branchNumber++;
+                    int currentBranchNumber = branchNumber;
+                    var branchConstraint = cplex.AddEq(x[(int)BranchNode], 1.0, currentBranchNumber.ToString());
+                    int For1Branch = Branching(cplex, x);
+                    //Удалить ограничение
+                    cplex.Remove(branchConstraint);
+                    branchConstraint = cplex.AddEq(x[(int)BranchNode], 0.0, currentBranchNumber.ToString());
+                    int For2Branch = Branching(cplex, x);
+                    return For1Branch > For2Branch ? For1Branch : For2Branch;
+                }
+            }
+            return 0;
+        }
+        private static int? getNodeForBranching(double[] res)
+        {
+            Dictionary<int, double> cuttedNodes = new Dictionary<int, double>();
+            for (int j = 0; j < res.Length; ++j)
+            {
+                if (res[j] < 1 && res[j] > 0)
+                {
+                    cuttedNodes.Add(j, res[j]);
+                }
+            }
+            int? result = (from r in cuttedNodes where r.Value == cuttedNodes.Values.Max() select r.Key).FirstOrDefault();
+            return result;
+        }
+        private static List<int> getClickFromSolution(double[] res)
+        {
+            List<int> click = new List<int>();
+            for (int j = 0; j < res.Length; ++j)
+            {
+                if (res[j] < 1 && res[j] > 0)
+                {
+                    click.Add(j);
+                }
+            }
+            return click;
+        }
         private static void MyTimer_Elapsed(object sender, ElapsedEventArgs e)
         {
             Console.WriteLine("Time is out");
