@@ -20,8 +20,11 @@ namespace ConsoleApp1
 
 
 
+
     class Program
     {
+        const double epsilon = 0.000001;
+        const int maxIterObjectiveNotChange = 30;
         static Random random = null;
         public static List<int> globalClick = new List<int>();
         public static int branchNumber = 0;
@@ -29,6 +32,7 @@ namespace ConsoleApp1
         static List<int> maxClique;
         static string graphFile = "";
         static DateTime startTime;
+        static int pointer = 0;
         static void Main(string[] args)
         {
             try
@@ -66,6 +70,8 @@ namespace ConsoleApp1
                 int cntr = 0;
                 //Зададим базовую модель
                 Cplex cplex = new Cplex();
+               
+                cplex.SetOut(System.IO.TextWriter.Null);
                 IRange[][] rng = new IRange[1][];
                 INumVar[][] var = new INumVar[1][];
                 rng[0] = new IRange[graph.NumberNodes * graph.NumberNodes];
@@ -85,7 +91,7 @@ namespace ConsoleApp1
                 //Будем иметь в виду, что количество цветов - это верхняя оценка на размер клики, а найденная эвристически клика на первом этапе - нижняя оценка.
                 int colorCount = colorizedGraph.Values.Max();
                 List<int> colorizedNodes = new List<int>();
-                int pointer = 1;
+                pointer = 1;
                 //Добавим ограничение, что вершины, входящие в один цветовой класс, не связаны между собой
                 for (int i = 1; i <= colorCount; ++i)
                 {
@@ -103,24 +109,24 @@ namespace ConsoleApp1
                         pointer++;
                     }
                 }
-                for (int i =0; i<graph.NumberNodes; i++)
-                {
-                    for (int j = i+1; j<graph.NumberNodes; j++)
-                    {
-                        if (!graph.AreAdjacent(i, j))
-                        {
-                            rng[0][pointer] = cplex.AddLe(cplex.Sum(cplex.Prod(1.0, x[i]), cplex.Prod(1.0, x[j])), 1.0, "c" + (pointer));
-                            pointer++;
-                        }
-                    }
-                }
+                //for (int i =0; i<graph.NumberNodes; i++)
+                //{
+                //    for (int j = i+1; j<graph.NumberNodes; j++)
+                //    {
+                //        if (!graph.AreAdjacent(i, j))
+                //        {
+                //            rng[0][pointer] = cplex.AddLe(cplex.Sum(cplex.Prod(1.0, x[i]), cplex.Prod(1.0, x[j])), 1.0, "c" + (pointer));
+                //            pointer++;
+                //        }
+                //    }
+                //}
 
                 //------------------------------------------------------------------------
                 //-----Пробуем решать задачу ровно до тех пор, пока не получим клику------
                 //-----Помним про ограничения на размер клики-----------------------------
                 int countOfConstraint = colorCount;
                 globalClick = maxClique;
-                Branching(cplex, x);
+                Branching(cplex, x, graph);
                 cplex.End();
                 ////Максимальная клика, которую можно найти для вершины - это количество различных цветов, в которые окрашены все ее соседи плюс она  сама
                 //foreach (KeyValuePair<int,int> pair in nodeAndNeighbors)
@@ -190,60 +196,206 @@ namespace ConsoleApp1
             });
             return colorizedGraph;   
         }
-        private static int Branching( Cplex cplex, INumVar[] x)
+        private static void Branching( Cplex cplex, INumVar[] x, MyGraph g)
         {
-            cplex.Solve();
-            double[] res = cplex.GetValues(x);
-            double[] dj = cplex.GetReducedCosts(x);
-            double solveResult = res.Sum();
-            if (solveResult>globalClick.Count)
+            bool hasBrokenConstraint = true;
+            //double objective = 0.0;
+            //double objectiveNotChangeNRounds = 0;
+            while (hasBrokenConstraint)
             {
-                //Пытаемся выполнить ветвление
-                //Если ветвиться не по чему - это наша искомая клика
-                int? BranchNode = getNodeForBranching(res);
-                if (BranchNode == null)
+                //Console.WriteLine("Start");
+                cplex.ExportModel("F:/lpex1.lp");
+                hasBrokenConstraint = false;
+                //start
+                if (!cplex.Solve())
                 {
-                    var click = getClickFromSolution(res);
-                    if (click.Count> globalClick.Count)
+                    //Console.WriteLine("CPLEX found no solution");
+                    return;
+                }
+                
+                double[] res = cplex.GetValues(x);
+                double[] dj = cplex.GetReducedCosts(x);
+                double solveResult = res.Sum();
+                //Console.WriteLine("Objextive {0} {1}", solveResult, Math.Truncate(solveResult+ epsilon));
+                //Console.WriteLine(String.Join(" ", res));
+                if (Math.Truncate(solveResult+epsilon) > globalClick.Count)
+
+                {
+                   // Console.Write("Candidates:\n");
+                    //Красим все вершины, вес которых больше 0
+                    List<int> candidates = new List<int>();
+                    for (int i = 0; i < res.Length; ++i)
                     {
-                        globalClick = click;
+                        if (res[i] > 0+epsilon)
+                        {
+                            candidates.Add(i);
+                        }
                     }
-                    return click.Count();
+
+                    //if (Math.Abs(solveResult - objective) < epsilon)
+                    //{
+                    //    objectiveNotChangeNRounds++;
+                    //}
+                    //else
+                    //{
+                    //    objectiveNotChangeNRounds = 0;
+                    //}
+                    //objective = solveResult;
+                    //if (objectiveNotChangeNRounds <= maxIterObjectiveNotChange)
+                    //{
+
+                        candidates.Sort((t1, t2) =>
+                        {
+                            return res[t1].CompareTo(res[t2]);
+                        });
+                        //Красим найденные вершины
+                        var colorizedCandidates = colorize(candidates, g);
+                        //Ищем нарушенные независимые множества с суммарным весом больше 1
+                        int maxColor = colorizedCandidates.Values.Max();
+                        List<int> colorizedNodes = new List<int>();
+
+                        for (int i = 1; i <= maxColor; ++i)
+                        {
+                            colorizedNodes = (from t in colorizedCandidates where t.Value == i select t.Key).ToList<int>();
+                            if (colorizedNodes.Count() > 1)
+                            {
+                                //Берем сумму весов вершин, образующих независимое множество
+                                double summ = 0;
+
+                                colorizedNodes.ForEach(n =>
+                               {
+                                   summ += res[n];
+                               });
+                                //Если сумма больше 1 - нашли нарушенное правило, добавляем его
+                                if ((summ - 1.0) / colorizedNodes.Count > epsilon)
+                                {
+                                     //Console.Write("Add Constraint:\n");
+                                     //Console.WriteLine(String.Join(" ", colorizedNodes));
+                                     //Console.WriteLine(String.Format("Sum = {0}" , summ));
+                                    hasBrokenConstraint = true;
+                                    INumExpr[] constraint = new INumExpr[colorizedNodes.Count()];
+                                    int counter = 0;
+                                    colorizedNodes.ForEach(node =>
+                                    {
+                                        constraint[counter] = cplex.Prod(1.0, x[node]);
+                                        counter++;
+                                    });
+                                    cplex.AddLe(cplex.Sum(constraint), 1.0, "c" + pointer.ToString());
+                                    pointer++;
+                                }
+                            }
+                        }
+                       // Console.ReadKey();
+                    //}
+                    //else
+                    //{
+                    //    Console.WriteLine(String.Format("Not change {1} objective {0} iters", objectiveNotChangeNRounds, objective));
+                    //}
+                    if (hasBrokenConstraint)
+                    {
+                        //goto start
+                        continue;
+                    }
+                    else
+                    {
+                        //Пытаемся выполнить ветвление
+                        //Если ветвиться не по чему - это наша искомая клика
+                        int? BranchNode = getNodeForBranching(res);
+                        if (BranchNode == null)
+                        {
+                            /*
+                            var click = getClickFromSolution(res);
+                            if (click.Count > globalClick.Count)
+                            {
+                                globalClick = click;
+                            }
+                            return;
+    */
+                            //Проверяем, максимальная ли это клика.
+                            for (int i = 0; i < candidates.Count; i++)
+                            {
+                                for (int j = i + 1; j < candidates.Count; j++)
+                                {
+                                    if (!g.AreAdjacent(candidates[i], candidates[j]))
+                                    {
+                                        cplex.AddLe(cplex.Sum(cplex.Prod(1.0, x[candidates[i]]), cplex.Prod(1.0, x[candidates[j]])), 1.0, "c"+pointer.ToString());
+                                        pointer++;
+                                        hasBrokenConstraint = true;
+
+                                        //Console.Write("Add Constraint (integer):\n");
+                                        //Console.WriteLine(String.Format("{0} {1}", x[candidates[i]], x[candidates[j]] ));
+                                        //Console.WriteLine(String.Format("Values {0} {1}", res[candidates[i]],res[candidates[j]]));
+                                      
+                                    }
+                                    if (hasBrokenConstraint) break;
+                                }
+                            }
+                            if (hasBrokenConstraint)
+                            {
+                                continue;
+                            }
+                            else
+                            {
+                                //Мы нашли максимальную на данный момент клику
+                                var click = getClickFromSolution(res);
+                              
+                                if (click.Count > globalClick.Count)
+                                {
+                                    globalClick = click;
+                                }
+                                return;
+                            }
+                        }
+
+                        else
+                        {
+                            branchNumber++;
+                            //Console.WriteLine("Branching by"+ BranchNode.ToString());
+                            //Console.WriteLine(String.Format("Value: {0}, {1}", res[(int)BranchNode], Math.Abs(Math.Round(res[(int)BranchNode]) - res[(int)BranchNode])));
+                            var branchConstraint = cplex.AddEq(x[(int)BranchNode], 1.0, "c" + pointer.ToString());
+                            pointer++;
+
+                            //Console.WriteLine("left by " + BranchNode.ToString());
+                            Branching(cplex, x, g);
+                            //Удалить ограничение
+                            cplex.Remove(branchConstraint);
+                            branchConstraint = cplex.AddEq(x[(int)BranchNode], 0.0, "c"+pointer.ToString());
+                            pointer++;
+                            //Console.WriteLine("rihgt by " + BranchNode.ToString());
+                            Branching(cplex, x, g);
+                            cplex.Remove(branchConstraint);
+
+                            return;
+                        }
+                    }
                 }
                 else
                 {
-                    branchNumber++;
-                    int currentBranchNumber = branchNumber;
-                    var branchConstraint = cplex.AddEq(x[(int)BranchNode], 1.0, currentBranchNumber.ToString());
-                    int For1Branch = Branching(cplex, x);
-                    //Удалить ограничение
-                    cplex.Remove(branchConstraint);
-                    branchConstraint = cplex.AddEq(x[(int)BranchNode], 0.0, currentBranchNumber.ToString());
-                    int For2Branch = Branching(cplex, x);
-                    return For1Branch > For2Branch ? For1Branch : For2Branch;
+                    return;
                 }
             }
-            return 0;
         }
         private static int? getNodeForBranching(double[] res)
         {
             Dictionary<int, double> cuttedNodes = new Dictionary<int, double>();
             for (int j = 0; j < res.Length; ++j)
             {
-                if (res[j] < 1 && res[j] > 0)
+                if (Math.Abs(Math.Round(res[j])-res[j])>epsilon)
                 {
-                    cuttedNodes.Add(j, res[j]);
+                    //Console.WriteLine(string.Format("Add node for branch {0}", j));
+                    cuttedNodes.Add(j+1, res[j]);
                 }
             }
             int? result = (from r in cuttedNodes where r.Value == cuttedNodes.Values.Max() select r.Key).FirstOrDefault();
-            return result;
+            //Console.WriteLine("Result" + result.ToString());
+            return result == 0 ? null : result - 1;
         }
         private static List<int> getClickFromSolution(double[] res)
         {
             List<int> click = new List<int>();
             for (int j = 0; j < res.Length; ++j)
             {
-                if (res[j] < 1 && res[j] > 0)
+                if (res[j] == 1)
                 {
                     click.Add(j);
                 }
@@ -270,9 +422,9 @@ namespace ConsoleApp1
         }
         private static void WriteResults(TimeSpan time, List<int> clique, bool istimeLimitReached)
         {
-            FileStream ifs = new FileStream(@".\Khrustaleva_N.xls", FileMode.Append);
+            FileStream ifs = new FileStream(@"F:\Khrustaleva_N.xls", FileMode.Append);
             StreamWriter sw = new StreamWriter(ifs);
-            string times = (time.Hours * 3600 + time.Minutes * 60 + time.Seconds).ToString();
+            string times = (time.Hours * 3600 + time.Minutes * 60 + time.Seconds + time.Milliseconds/1000).ToString();
             string result = graphFile + ";" + times + ";" + clique.Count() + ";" + istimeLimitReached + Environment.NewLine;
             sw.Write(result);
             sw.Close();
